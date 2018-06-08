@@ -24,53 +24,12 @@ import (
 	"github.com/nfnt/resize"
 )
 
-var (
-	accessKeyID     string
-	secretAccessKey string
-	region          string
-	maxRetry        int
-	sizes           []image.Point
-)
-
-func init() {
-	accessKeyID := os.Getenv("AccessKeyID")
-	secretAccessKey := os.Getenv("SecretAccessKey")
-	region := os.Getenv("Region")
-	sizeString := os.Getenv("Sizes")
-	if accessKeyID == "" || secretAccessKey == "" || region == "" || sizeString == "" {
-		panic("Environment viriables is invalid")
-	}
-
-	pattern := regexp.MustCompile("(\\d+)x(\\d+)")
-	for _, group := range pattern.FindAllStringSubmatch(sizeString, -1) {
-		if len(group) != 3 {
-			panic(fmt.Sprintf("Environment viriables Sizes %v is invalid", group))
-		}
-
-		width, err := strconv.Atoi(group[1])
-		if err != nil {
-			panic(fmt.Sprintf("Environment viriables Sizes %v is invalid: %v", group, err))
-		}
-
-		height, err := strconv.Atoi(group[2])
-		if err != nil {
-			panic(fmt.Sprintf("Environment viriables Sizes %v is invalid: %v", group, err))
-		}
-
-		sizes = append(sizes, image.Pt(width, height))
-	}
-
-	var err error
-	maxRetry, err = strconv.Atoi(os.Getenv("MaxRetries"))
-	if err != nil {
-		maxRetry = 3
-	}
-
-	fmt.Printf("AccessKeyID: %s\n", accessKeyID)
-	fmt.Printf("SecretAccessKey: %s\n", secretAccessKey)
-	fmt.Printf("Region: %s\n", region)
-	fmt.Printf("Sizes: %v\n", sizes)
-	fmt.Printf("MaxRetries: %d\n", maxRetry)
+type Config struct {
+	AccessKeyID     string
+	SecretAccessKey string
+	Region          string
+	MaxRetry        int
+	Sizes           []image.Point
 }
 
 func main() {
@@ -82,7 +41,7 @@ func handler(ctx context.Context, s3Event events.S3Event) {
 	wg.Add(len(s3Event.Records))
 
 	for _, record := range s3Event.Records {
-		fmt.Printf("Create Object: %s\n", record.S3.Object.Key)
+		fmt.Printf("%s Object: %s\n", record.EventName, record.S3.Object.Key)
 		if strings.HasSuffix(record.S3.Object.Key, "/") {
 			// 创建了目录
 			fmt.Printf("Create a dir %s", record.S3.Object.Key)
@@ -97,9 +56,17 @@ func handler(ctx context.Context, s3Event events.S3Event) {
 
 func onFileCreated(ctx context.Context, record events.S3EventRecord, wg *sync.WaitGroup) {
 
+	conf, err := readConfig()
+	if err != nil {
+		fmt.Printf("Read config failed due to %v", err)
+		return
+	}
+
 	// 初始化s3 session
-	creds := credentials.NewStaticCredentialsFromCreds(credentials.Value{AccessKeyID: accessKeyID, SecretAccessKey: secretAccessKey})
-	config := aws.NewConfig().WithCredentials(creds).WithRegion(region).WithMaxRetries(maxRetry)
+	creds := credentials.NewStaticCredentialsFromCreds(credentials.Value{AccessKeyID: conf.AccessKeyID, SecretAccessKey: conf.SecretAccessKey})
+	config := aws.NewConfig().WithCredentials(creds).WithRegion(conf.Region).WithMaxRetries(conf.MaxRetry)
+
+	fmt.Printf("config region [%s](%v)\n", aws.StringValue(config.Region), config.Region)
 
 	_session, err := session.NewSession(config)
 	if err != nil {
@@ -107,8 +74,10 @@ func onFileCreated(ctx context.Context, record events.S3EventRecord, wg *sync.Wa
 		return
 	}
 
+	fmt.Printf("_session config region [%s]\n", aws.StringValue(_session.Config.Region))
 	// 为了包含region设置不许要new一个config
-	client := s3.New(_session, aws.NewConfig().WithRegion(region))
+	client := s3.New(_session, aws.NewConfig().WithRegion(conf.Region))
+	fmt.Printf("client config region [%s](%v) and SigningRegion [%s]\n", aws.StringValue(client.Config.Region), client.Config.Region, client.SigningRegion)
 
 	// 尝试从S3读取图像
 	src, err := readImage(ctx, client, record)
@@ -117,7 +86,7 @@ func onFileCreated(ctx context.Context, record events.S3EventRecord, wg *sync.Wa
 		return
 	}
 
-	for _, size := range sizes {
+	for _, size := range conf.Sizes {
 
 		// 生成缩略图
 		dest := resize.Thumbnail(uint(size.X), uint(size.Y), src, resize.Lanczos3)
@@ -134,6 +103,56 @@ func onFileCreated(ctx context.Context, record events.S3EventRecord, wg *sync.Wa
 	}
 
 	wg.Done()
+}
+
+func readConfig() (*Config, error) {
+	accessKeyID := os.Getenv("AccessKeyID")
+	secretAccessKey := os.Getenv("SecretAccessKey")
+	region := os.Getenv("Region")
+	sizeString := os.Getenv("Sizes")
+	if accessKeyID == "" || secretAccessKey == "" || region == "" || sizeString == "" {
+		return nil, fmt.Errorf("Environment viriables is invalid")
+	}
+
+	var sizes []image.Point
+	pattern := regexp.MustCompile("(\\d+)x(\\d+)")
+	for _, group := range pattern.FindAllStringSubmatch(sizeString, -1) {
+		if len(group) != 3 {
+			return nil, fmt.Errorf("Environment viriables Sizes %v is invalid", group)
+		}
+
+		width, err := strconv.Atoi(group[1])
+		if err != nil {
+			return nil, fmt.Errorf("Environment viriables Sizes %v is invalid: %v", group, err)
+		}
+
+		height, err := strconv.Atoi(group[2])
+		if err != nil {
+			return nil, fmt.Errorf("Environment viriables Sizes %v is invalid: %v", group, err)
+		}
+
+		sizes = append(sizes, image.Pt(width, height))
+	}
+
+	var err error
+	maxRetry, err := strconv.Atoi(os.Getenv("MaxRetries"))
+	if err != nil {
+		maxRetry = 3
+	}
+
+	fmt.Printf("AccessKeyID: %s\n", accessKeyID)
+	fmt.Printf("SecretAccessKey: %s\n", secretAccessKey)
+	fmt.Printf("Region: %s\n", region)
+	fmt.Printf("Sizes: %v\n", sizes)
+	fmt.Printf("MaxRetries: %d\n", maxRetry)
+
+	return &Config{
+		AccessKeyID:     accessKeyID,
+		SecretAccessKey: secretAccessKey,
+		Region:          region,
+		Sizes:           sizes,
+		MaxRetry:        maxRetry,
+	}, nil
 }
 
 func readImage(ctx context.Context, client *s3.S3, record events.S3EventRecord) (image.Image, error) {
