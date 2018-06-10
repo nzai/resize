@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"image/jpeg"
 
@@ -27,66 +28,89 @@ import (
 type Config struct {
 	AccessKeyID     string
 	SecretAccessKey string
-	Region          string
 	MaxRetry        int
 	Sizes           []image.Point
 }
 
+var (
+	sizePattern *regexp.Regexp
+)
+
 func main() {
+	sizePattern = regexp.MustCompile("(\\d+)x(\\d+)")
 	lambda.Start(handler)
 }
 
 func handler(ctx context.Context, s3Event events.S3Event) {
+
+	if len(s3Event.Records) == 0 {
+		return
+	}
+
+	conf, err := readConfig()
+	if err != nil {
+		fmt.Printf("Read config failed due to %v\n", err)
+		return
+	}
+
+	client, err := initS3Client(conf, s3Event.Records[0].AWSRegion)
+	if err != nil {
+		fmt.Printf("Init s3 client failed due to %v\n", err)
+		return
+	}
+
 	wg := new(sync.WaitGroup)
 	wg.Add(len(s3Event.Records))
 
 	for _, record := range s3Event.Records {
-		fmt.Printf("%s Object: %s\n", record.EventName, record.S3.Object.Key)
+
 		if strings.HasSuffix(record.S3.Object.Key, "/") {
 			// 创建了目录
-			fmt.Printf("Create a dir %s", record.S3.Object.Key)
+			fmt.Printf("Ignore dir %s\n", record.S3.Object.Key)
 			wg.Done()
 			continue
 		}
 
-		go onFileCreated(ctx, record, wg)
+		if sizePattern.Match([]byte(record.S3.Object.Key)) {
+			// 忽略resize上传的缩略图
+			fmt.Printf("Ignore thumbail %s\n", record.S3.Object.Key)
+			wg.Done()
+			continue
+		}
+
+		fmt.Printf("Object: %s  Event:%+v\n", record.S3.Object.Key, record)
+		go onFileCreated(ctx, record, conf, client, wg)
 	}
 	wg.Wait()
 }
 
-func onFileCreated(ctx context.Context, record events.S3EventRecord, wg *sync.WaitGroup) {
-
-	conf, err := readConfig()
-	if err != nil {
-		fmt.Printf("Read config failed due to %v", err)
-		return
-	}
+func initS3Client(config *Config, region string) (*s3.S3, error) {
 
 	// 初始化s3 session
-	creds := credentials.NewStaticCredentialsFromCreds(credentials.Value{AccessKeyID: conf.AccessKeyID, SecretAccessKey: conf.SecretAccessKey})
-	config := aws.NewConfig().WithCredentials(creds).WithRegion(conf.Region).WithMaxRetries(conf.MaxRetry)
+	creds := credentials.NewStaticCredentialsFromCreds(credentials.Value{AccessKeyID: config.AccessKeyID, SecretAccessKey: config.SecretAccessKey})
+	awsConfig := aws.NewConfig().WithCredentials(creds).WithRegion(region).WithMaxRetries(config.MaxRetry)
 
-	fmt.Printf("config region [%s](%v)\n", aws.StringValue(config.Region), config.Region)
-
-	_session, err := session.NewSession(config)
+	_session, err := session.NewSession(awsConfig)
 	if err != nil {
-		fmt.Printf("New session failed due to %v", err)
-		return
+		return nil, fmt.Errorf("New session failed due to %v", err)
 	}
 
-	fmt.Printf("_session config region [%s]\n", aws.StringValue(_session.Config.Region))
-	// 为了包含region设置不许要new一个config
-	client := s3.New(_session, aws.NewConfig().WithRegion(conf.Region))
-	fmt.Printf("client config region [%s](%v) and SigningRegion [%s]\n", aws.StringValue(client.Config.Region), client.Config.Region, client.SigningRegion)
+	return s3.New(_session, awsConfig), nil
+}
 
+func onFileCreated(ctx context.Context, record events.S3EventRecord, config *Config, client *s3.S3, wg *sync.WaitGroup) {
+
+	start := time.Now()
 	// 尝试从S3读取图像
 	src, err := readImage(ctx, client, record)
 	if err != nil {
-		fmt.Printf("Read image from object %s from bucket %s failed due to %v", record.S3.Object.Key, record.S3.Bucket.Name, err)
+		fmt.Printf("Read image from object %s from bucket %s failed due to %v\n", record.S3.Object.Key, record.S3.Bucket.Name, err)
 		return
 	}
 
-	for _, size := range conf.Sizes {
+	for _, size := range config.Sizes {
+
+		fmt.Printf("Start %dx%d %s\n", size.X, size.Y, time.Now().Sub(start).String())
 
 		// 生成缩略图
 		dest := resize.Thumbnail(uint(size.X), uint(size.Y), src, resize.Lanczos3)
@@ -95,11 +119,12 @@ func onFileCreated(ctx context.Context, record events.S3EventRecord, wg *sync.Wa
 		key := objectKeyWithSize(record.S3.Object.Key, size)
 		err = saveImage(ctx, client, dest, record.S3.Bucket.Name, key)
 		if err != nil {
-			fmt.Printf("Save image to bucket %s object %s failed due to %v", record.S3.Bucket.Name, key, err)
+			fmt.Printf("Save image to bucket %s object %s failed due to %v\n", record.S3.Bucket.Name, key, err)
 			return
 		}
 
 		// 发送完成通知
+		fmt.Printf("Create thumbail %s success in %s\n", key, time.Now().Sub(start).String())
 	}
 
 	wg.Done()
@@ -108,15 +133,13 @@ func onFileCreated(ctx context.Context, record events.S3EventRecord, wg *sync.Wa
 func readConfig() (*Config, error) {
 	accessKeyID := os.Getenv("AccessKeyID")
 	secretAccessKey := os.Getenv("SecretAccessKey")
-	region := os.Getenv("Region")
 	sizeString := os.Getenv("Sizes")
-	if accessKeyID == "" || secretAccessKey == "" || region == "" || sizeString == "" {
+	if accessKeyID == "" || secretAccessKey == "" || sizeString == "" {
 		return nil, fmt.Errorf("Environment viriables is invalid")
 	}
 
 	var sizes []image.Point
-	pattern := regexp.MustCompile("(\\d+)x(\\d+)")
-	for _, group := range pattern.FindAllStringSubmatch(sizeString, -1) {
+	for _, group := range sizePattern.FindAllStringSubmatch(sizeString, -1) {
 		if len(group) != 3 {
 			return nil, fmt.Errorf("Environment viriables Sizes %v is invalid", group)
 		}
@@ -140,16 +163,16 @@ func readConfig() (*Config, error) {
 		maxRetry = 3
 	}
 
-	fmt.Printf("AccessKeyID: %s\n", accessKeyID)
-	fmt.Printf("SecretAccessKey: %s\n", secretAccessKey)
-	fmt.Printf("Region: %s\n", region)
-	fmt.Printf("Sizes: %v\n", sizes)
-	fmt.Printf("MaxRetries: %d\n", maxRetry)
+	if os.Getenv("debug") == "true" {
+		fmt.Printf("AccessKeyID: %s\n", accessKeyID)
+		fmt.Printf("SecretAccessKey: %s\n", secretAccessKey)
+		fmt.Printf("Sizes: %v\n", sizes)
+		fmt.Printf("MaxRetries: %d\n", maxRetry)
+	}
 
 	return &Config{
 		AccessKeyID:     accessKeyID,
 		SecretAccessKey: secretAccessKey,
-		Region:          region,
 		Sizes:           sizes,
 		MaxRetry:        maxRetry,
 	}, nil
@@ -163,7 +186,7 @@ func readImage(ctx context.Context, client *s3.S3, record events.S3EventRecord) 
 		Key:    aws.String(record.S3.Object.Key),
 	})
 	if err != nil {
-		fmt.Printf("Get object %s from bucket %s failed due to %v", record.S3.Object.Key, record.S3.Bucket.Name, err)
+		fmt.Printf("Get object %s from bucket %s failed due to %v\n", record.S3.Object.Key, record.S3.Bucket.Name, err)
 		return nil, err
 	}
 	defer output.Body.Close()
@@ -186,9 +209,10 @@ func saveImage(ctx context.Context, client *s3.S3, dest image.Image, bucket, key
 		Key:          aws.String(key),
 		Body:         bytes.NewReader(buffer.Bytes()),
 		StorageClass: aws.String(s3.ObjectStorageClassStandard),
+		Metadata:     map[string]*string{"kind": aws.String("thumbail")},
 	})
 	if err != nil {
-		fmt.Printf("Put bucket %s object %s failed due to %v", bucket, key, err)
+		fmt.Printf("Put bucket %s object %s failed due to %v\n", bucket, key, err)
 		return err
 	}
 
@@ -197,5 +221,5 @@ func saveImage(ctx context.Context, client *s3.S3, dest image.Image, bucket, key
 
 func objectKeyWithSize(key string, size image.Point) string {
 	ext := filepath.Ext(key)
-	return strings.Replace(key, ext, fmt.Sprintf("_%dx%d.%s", size.X, size.Y, ext), -1)
+	return strings.Replace(key, ext, fmt.Sprintf("_%dx%d%s", size.X, size.Y, ext), -1)
 }
