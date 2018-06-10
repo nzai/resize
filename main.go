@@ -37,6 +37,8 @@ var (
 )
 
 func main() {
+	fmt.Printf("[Start]")
+	defer fmt.Printf("[End]")
 	sizePattern = regexp.MustCompile("(\\d+)x(\\d+)")
 	lambda.Start(handler)
 }
