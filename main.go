@@ -25,118 +25,47 @@ import (
 	"github.com/nfnt/resize"
 )
 
-type Config struct {
-	AccessKeyID     string
-	SecretAccessKey string
-	MaxRetry        int
-	Sizes           []image.Point
-}
-
 var (
-	sizePattern *regexp.Regexp
+	sizePattern = regexp.MustCompile("(\\d+)x(\\d+)")
 )
 
 func main() {
-	fmt.Printf("[Start]")
-	defer fmt.Printf("[End]")
-	sizePattern = regexp.MustCompile("(\\d+)x(\\d+)")
-	lambda.Start(handler)
-}
 
-func handler(ctx context.Context, s3Event events.S3Event) {
-
-	if len(s3Event.Records) == 0 {
-		return
-	}
-
-	conf, err := readConfig()
+	fmt.Printf("[Start]\n")
+	config, err := readConfig()
 	if err != nil {
 		fmt.Printf("Read config failed due to %v\n", err)
 		return
 	}
 
-	client, err := initS3Client(conf, s3Event.Records[0].AWSRegion)
-	if err != nil {
-		fmt.Printf("Init s3 client failed due to %v\n", err)
-		return
-	}
-
-	wg := new(sync.WaitGroup)
-	wg.Add(len(s3Event.Records))
-
-	for _, record := range s3Event.Records {
-
-		if strings.HasSuffix(record.S3.Object.Key, "/") {
-			// 创建了目录
-			fmt.Printf("Ignore dir %s\n", record.S3.Object.Key)
-			wg.Done()
-			continue
-		}
-
-		if sizePattern.Match([]byte(record.S3.Object.Key)) {
-			// 忽略resize上传的缩略图
-			fmt.Printf("Ignore thumbail %s\n", record.S3.Object.Key)
-			wg.Done()
-			continue
-		}
-
-		fmt.Printf("Object: %s  Event:%+v\n", record.S3.Object.Key, record)
-		go onFileCreated(ctx, record, conf, client, wg)
-	}
-	wg.Wait()
-}
-
-func initS3Client(config *Config, region string) (*s3.S3, error) {
-
-	// 初始化s3 session
+	// 初始化s3 client
 	creds := credentials.NewStaticCredentialsFromCreds(credentials.Value{AccessKeyID: config.AccessKeyID, SecretAccessKey: config.SecretAccessKey})
-	awsConfig := aws.NewConfig().WithCredentials(creds).WithRegion(region).WithMaxRetries(config.MaxRetry)
+	awsConfig := aws.NewConfig().WithCredentials(creds).WithRegion(config.Region).WithMaxRetries(config.MaxRetry)
+	client := s3.New(session.New(awsConfig))
 
-	_session, err := session.NewSession(awsConfig)
-	if err != nil {
-		return nil, fmt.Errorf("New session failed due to %v", err)
-	}
+	// 处理事件
+	imaging := NewImaging(config, client)
+	lambda.Start(imaging.S3Event)
 
-	return s3.New(_session, awsConfig), nil
+	fmt.Printf("[End]\n")
 }
 
-func onFileCreated(ctx context.Context, record events.S3EventRecord, config *Config, client *s3.S3, wg *sync.WaitGroup) {
-
-	start := time.Now()
-	// 尝试从S3读取图像
-	src, err := readImage(ctx, client, record)
-	if err != nil {
-		fmt.Printf("Read image from object %s from bucket %s failed due to %v\n", record.S3.Object.Key, record.S3.Bucket.Name, err)
-		return
-	}
-
-	for _, size := range config.Sizes {
-
-		fmt.Printf("Start %dx%d %s\n", size.X, size.Y, time.Now().Sub(start).String())
-
-		// 生成缩略图
-		dest := resize.Thumbnail(uint(size.X), uint(size.Y), src, resize.Lanczos3)
-
-		// 尝试保存到S3
-		key := objectKeyWithSize(record.S3.Object.Key, size)
-		err = saveImage(ctx, client, dest, record.S3.Bucket.Name, key)
-		if err != nil {
-			fmt.Printf("Save image to bucket %s object %s failed due to %v\n", record.S3.Bucket.Name, key, err)
-			return
-		}
-
-		// 发送完成通知
-		fmt.Printf("Create thumbail %s success in %s\n", key, time.Now().Sub(start).String())
-	}
-
-	wg.Done()
+// Config 配置
+type Config struct {
+	AccessKeyID     string
+	SecretAccessKey string
+	Region          string
+	MaxRetry        int
+	Sizes           []image.Point
 }
 
+// readConfig 从环境变量中读取配置
 func readConfig() (*Config, error) {
 	accessKeyID := os.Getenv("AccessKeyID")
 	secretAccessKey := os.Getenv("SecretAccessKey")
+	region := os.Getenv("Region")
 	sizeString := os.Getenv("Sizes")
-	if accessKeyID == "" || secretAccessKey == "" || sizeString == "" {
+	if accessKeyID == "" || secretAccessKey == "" || region == "" || sizeString == "" {
 		return nil, fmt.Errorf("Environment viriables is invalid")
 	}
 
@@ -175,43 +104,148 @@ func readConfig() (*Config, error) {
 	return &Config{
 		AccessKeyID:     accessKeyID,
 		SecretAccessKey: secretAccessKey,
+		Region:          region,
 		Sizes:           sizes,
 		MaxRetry:        maxRetry,
 	}, nil
 }
 
-func readImage(ctx context.Context, client *s3.S3, record events.S3EventRecord) (image.Image, error) {
+// Imaging 图片处理
+type Imaging struct {
+	config *Config
+	client *s3.S3
+}
 
+// NewImaging 新建图片处理
+func NewImaging(config *Config, client *s3.S3) *Imaging {
+	return &Imaging{config: config, client: client}
+}
+
+// S3Event S3事件
+func (s Imaging) S3Event(ctx context.Context, s3Event events.S3Event) {
+
+	wg := new(sync.WaitGroup)
+	wg.Add(len(s3Event.Records))
+
+	for _, record := range s3Event.Records {
+
+		// 创建了目录
+		if strings.HasSuffix(record.S3.Object.Key, "/") {
+			fmt.Printf("Ignore create dir %s\n", record.S3.Object.Key)
+			wg.Done()
+			continue
+		}
+
+		// 忽略resize上传的缩略图
+		if sizePattern.Match([]byte(record.S3.Object.Key)) {
+			fmt.Printf("Ignore thumbnail %s\n", record.S3.Object.Key)
+			wg.Done()
+			continue
+		}
+
+		// 只支持jpg
+		if !strings.HasSuffix(strings.ToLower(record.S3.Object.Key), ".jpg") {
+			fmt.Printf("Ignore unknown file type %s\n", record.S3.Object.Key)
+			wg.Done()
+			continue
+		}
+
+		fmt.Printf("Image created: %s\n", record.S3.Object.Key)
+		// 并行创建缩略图
+		go s.onImageCreated(ctx, record, wg)
+	}
+	wg.Wait()
+}
+
+// onImageCreated 有图片更新时创建缩略图
+func (s Imaging) onImageCreated(ctx context.Context, record events.S3EventRecord, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	// 尝试从S3读取图像
+	src, err := s.readImage(ctx, record)
+	if err != nil {
+		fmt.Printf("Read image from bucket %s object %s failed due to %v\n", record.S3.Bucket.Name, record.S3.Object.Key, err)
+		return
+	}
+
+	thumbnailWaitGroup := new(sync.WaitGroup)
+	thumbnailWaitGroup.Add(len(s.config.Sizes))
+	for _, size := range s.config.Sizes {
+		// 并行创建缩略图
+		go s.createThumbnail(ctx, record.S3.Bucket.Name, record.S3.Object.Key, src, size, thumbnailWaitGroup)
+	}
+
+	thumbnailWaitGroup.Wait()
+}
+
+// readImage 从key中读取图像
+func (s Imaging) readImage(ctx context.Context, record events.S3EventRecord) (image.Image, error) {
+
+	start := time.Now()
 	// 获取文件
-	output, err := client.GetObjectWithContext(ctx, &s3.GetObjectInput{
+	output, err := s.client.GetObjectWithContext(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(record.S3.Bucket.Name),
 		Key:    aws.String(record.S3.Object.Key),
 	})
 	if err != nil {
-		fmt.Printf("Get object %s from bucket %s failed due to %v\n", record.S3.Object.Key, record.S3.Bucket.Name, err)
+		fmt.Printf("Get object %s failed due to %v\n", record.S3.Object.Key, err)
 		return nil, err
 	}
 	defer output.Body.Close()
+	read := time.Now()
+	fmt.Printf("Read image %s in %s\n", record.S3.Object.Key, read.Sub(start).String())
 
 	// 读取图像
-	return jpeg.Decode(output.Body)
+	img, err := jpeg.Decode(output.Body)
+	if err != nil {
+		fmt.Printf("Decode image from %s failed due to %v\n", record.S3.Object.Key, err)
+		return nil, err
+	}
+	fmt.Printf("Decode image %s in %s\n", record.S3.Object.Key, time.Now().Sub(read).String())
+
+	return img, nil
 }
 
-func saveImage(ctx context.Context, client *s3.S3, dest image.Image, bucket, key string) error {
+// createThumbnail 创建缩略图
+func (s Imaging) createThumbnail(ctx context.Context, bucket, key string, src image.Image, size image.Point, wg *sync.WaitGroup) {
+	defer wg.Done()
+	start := time.Now()
+	fmt.Printf("Start create %dx%d thumbnail for %s\n", size.X, size.Y, key)
 
+	// 生成缩略图
+	thumbnail := resize.Thumbnail(uint(size.X), uint(size.Y), src, resize.Bilinear)
+	reiszed := time.Now()
+	fmt.Printf("Create %dx%d thumbnail for %s in %s\n", size.X, size.Y, key, reiszed.Sub(start).String())
+
+	// 尝试保存到S3
+	thumbnailKey := s.thumbnailKey(key, size)
+	err := s.saveThumbnail(ctx, thumbnail, bucket, thumbnailKey)
+	if err != nil {
+		fmt.Printf("Save thumbnail %s failed due to %v\n", thumbnailKey, err)
+		return
+	}
+
+	// 发送完成通知
+	fmt.Printf("Save thumbnail %s success in %s\n", thumbnailKey, time.Now().Sub(reiszed).String())
+}
+
+// saveThumbnail 保存缩略图
+func (s Imaging) saveThumbnail(ctx context.Context, thumbnail image.Image, bucket, key string) error {
+
+	// 按默认(75)的质量编码缩略图
 	buffer := new(bytes.Buffer)
-	err := jpeg.Encode(buffer, dest, nil)
+	err := jpeg.Encode(buffer, thumbnail, nil)
 	if err != nil {
 		fmt.Printf("Encode jpeg failed due to %v", err)
 		return err
 	}
 
-	_, err = client.PutObjectWithContext(ctx, &s3.PutObjectInput{
+	_, err = s.client.PutObjectWithContext(ctx, &s3.PutObjectInput{
 		Bucket:       aws.String(bucket),
 		Key:          aws.String(key),
 		Body:         bytes.NewReader(buffer.Bytes()),
 		StorageClass: aws.String(s3.ObjectStorageClassStandard),
-		Metadata:     map[string]*string{"kind": aws.String("thumbail")},
+		Metadata:     map[string]*string{"kind": aws.String("thumbnail")},
 	})
 	if err != nil {
 		fmt.Printf("Put bucket %s object %s failed due to %v\n", bucket, key, err)
@@ -221,7 +255,8 @@ func saveImage(ctx context.Context, client *s3.S3, dest image.Image, bucket, key
 	return nil
 }
 
-func objectKeyWithSize(key string, size image.Point) string {
+// thumbnailKey 缩略图的key
+func (s Imaging) thumbnailKey(key string, size image.Point) string {
 	ext := filepath.Ext(key)
 	return strings.Replace(key, ext, fmt.Sprintf("_%dx%d%s", size.X, size.Y, ext), -1)
 }
